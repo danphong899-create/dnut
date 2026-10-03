@@ -3,7 +3,8 @@
   "package": "com.example.addon.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "ExampleMixin"
+     "ExampleMixin",
+     "BossBarHudAccessor"
   ],
   "injectors": {
     "defaultRequire": 1
