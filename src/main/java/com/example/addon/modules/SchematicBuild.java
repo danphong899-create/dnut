@@ -1,9 +1,13 @@
 package com.example.addon.modules;
 
 import com.example.addon.DonutAddon;
+import com.example.addon.gui.BuildMenuScreen;
+import meteordevelopment.meteorclient.events.render.Render2DEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.gui.GuiThemes;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.utils.misc.Keybind;
 import meteordevelopment.meteorclient.utils.player.FindItemResult;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.meteorclient.utils.player.Rotations;
@@ -11,6 +15,7 @@ import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.*;
 import net.minecraft.block.enums.SlabType;
+import net.minecraft.client.gui.DrawContext;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemPlacementContext;
 import net.minecraft.item.ItemStack;
@@ -23,9 +28,14 @@ import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import org.lwjgl.PointerBuffer;
+import org.lwjgl.glfw.GLFW;
+import org.lwjgl.system.MemoryStack;
+import org.lwjgl.util.tinyfd.TinyFileDialogs;
 
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,6 +46,8 @@ import java.util.zip.GZIPInputStream;
 /**
  * Builds a Litematica ".litematic" file, lowest layer first.
  *
+ *  - Pick the file with the "Nạp schematic" button (native file dialog) or drag & drop it onto the menu.
+ *  - Menu (key J), run/pause (key P), HUD with progress.
  *  - Orientation (facing, axis, half, face, sign rotation, door hinge, slab top/bottom): the module asks the game's own
  *    placement logic which view direction + clicked face gives the schematic's state, then looks that way and clicks it.
  *  - Double slabs: first half, then the second half on top of it.
@@ -45,6 +57,7 @@ import java.util.zip.GZIPInputStream;
 public class SchematicBuild extends Module {
     private record Target(BlockPos pos, BlockState state) {}
     private record Plan(float yaw, float pitch, BlockPos neighbor, Direction side, Vec3d hit) {}
+    public record Need(String name, int need, int have) {}
     private static final class Fix {
         final Target t; int attempts;
         Fix(Target t) { this.t = t; }
@@ -70,10 +83,24 @@ public class SchematicBuild extends Module {
 
     private final SettingGroup sg = settings.getDefaultGroup();
     private final SettingGroup sgExtra = settings.createGroup("Extras");
+    private final SettingGroup sgUi = settings.createGroup("Giao diện / UI");
 
+    // stored path of the chosen file (set through the file dialog, no need to type it)
     private final Setting<String> file = sg.add(new StringSetting.Builder()
-        .name("file").description("Full path to the .litematic file, e.g. C:\\Users\\you\\AppData\\Roaming\\.minecraft\\schematics\\house.litematic")
-        .defaultValue("").build());
+        .name("file").description("Đường dẫn file .litematic đã chọn (dùng nút Pick file / menu để chọn, không cần gõ).")
+        .defaultValue("").visible(() -> false).build());
+
+    private final Setting<Boolean> pickBtn = sg.add(new BoolSetting.Builder()
+        .name("pick-file").description("Bật để mở hộp thoại chọn file .litematic từ máy của bạn.")
+        .defaultValue(false)
+        .onChanged(v -> { if (v) { this.pickBtn.set(false); mc.execute(this::pickFile); } })
+        .build());
+
+    private final Setting<Boolean> openMenuBtn = sg.add(new BoolSetting.Builder()
+        .name("open-menu").description("Bật để mở menu AutoBuild.")
+        .defaultValue(false)
+        .onChanged(v -> { if (v) { this.openMenuBtn.set(false); mc.execute(this::openMenu); } })
+        .build());
 
     private final Setting<Integer> forwardOffset = sg.add(new IntSetting.Builder()
         .name("forward-offset").description("The schematic's corner starts this many blocks in front of you.")
@@ -94,7 +121,11 @@ public class SchematicBuild extends Module {
     private final Setting<Boolean> notify = sg.add(new BoolSetting.Builder()
         .name("notifications").defaultValue(true).build());
 
-    private final Setting<Boolean> useScaffold = sgExtra.add(new BoolSetting.Builder()
+    public final Setting<Boolean> autoStart = sg.add(new BoolSetting.Builder()
+        .name("auto-start").description("Tự bắt đầu xây ngay sau khi nạp file (tắt = chờ bấm Bắt đầu / phím P).")
+        .defaultValue(false).build());
+
+    public final Setting<Boolean> useScaffold = sgExtra.add(new BoolSetting.Builder()
         .name("use-scaffold").description("Place a temporary block next to floating blocks, then break it.")
         .defaultValue(true).build());
 
@@ -102,54 +133,217 @@ public class SchematicBuild extends Module {
         .name("scaffold-block").description("Block used as temporary support (must be in your hotbar; pick one you can break quickly).")
         .defaultValue(Blocks.COBBLESTONE).build());
 
-    private final Setting<Boolean> fixStates = sgExtra.add(new BoolSetting.Builder()
+    public final Setting<Boolean> fixStates = sgExtra.add(new BoolSetting.Builder()
         .name("fix-states").description("Click repeaters, comparators, doors, trapdoors, gates and levers into the right state.")
         .defaultValue(true).build());
+
+    public final Setting<Boolean> strictLayers = sgExtra.add(new BoolSetting.Builder()
+        .name("strict-layers").description("Xây hết một tầng Y rồi mới lên tầng tiếp theo.")
+        .defaultValue(true).build());
+
+    public final Setting<Boolean> hud = sgUi.add(new BoolSetting.Builder()
+        .name("hud").description("Hiện bảng tiến độ trên màn hình.").defaultValue(true).build());
+
+    public final Setting<Boolean> vietnamese = sgUi.add(new BoolSetting.Builder()
+        .name("vietnamese").description("Ngôn ngữ: bật = Tiếng Việt, tắt = English.").defaultValue(true).build());
+
+    private final Setting<Keybind> menuKey = sgUi.add(new KeybindSetting.Builder()
+        .name("menu-key").description("Mở menu (hoạt động khi module đang bật).")
+        .defaultValue(Keybind.fromKey(GLFW.GLFW_KEY_J)).action(this::openMenu).build());
+
+    private final Setting<Keybind> runKey = sgUi.add(new KeybindSetting.Builder()
+        .name("run-pause-key").description("Chạy / tạm dừng (hoạt động khi module đang bật).")
+        .defaultValue(Keybind.fromKey(GLFW.GLFW_KEY_P)).action(this::toggleRun).build());
 
     private final List<Target> pending = new ArrayList<>();
     private final Set<BlockPos> targetSet = new HashSet<>();
     private final Set<BlockPos> unmatched = new HashSet<>();
     private final Map<BlockPos, BlockPos> scaffolds = new LinkedHashMap<>(); // scaffold pos -> target it supports
     private final List<Fix> fixes = new ArrayList<>();
-    private int timer, warnCooldown, stall, skippedLoad;
-    private boolean abort, lastHadNeighbor;
+    private final Map<Integer, Integer> layerTotals = new HashMap<>();
+    private int timer, warnCooldown, stall, skippedLoad, statTimer;
+    private boolean lastHadNeighbor;
+
+    // state shared with the menu / HUD
+    private boolean running, finished, picking, forceClean;
+    private String loadedName = "";
+    private BlockPos anchor;
+    private int totalCount;
+    private Integer yMin, yMax; // absolute world Y, null = all
+
+    // cached stats
+    private boolean statHasLayer;
+    private int statLayerY, statLayerDone, statLayerTotal;
+    private int statNeed, statHave;
+    private List<Need> statNeeds = List.of();
 
     public SchematicBuild() {
         super(DonutAddon.CATEGORY, "schematic-build", "Builds a .litematic file in front of you: correct orientation, scaffolding and clickable states.");
+    }
+
+    // ------------------------------------------------------------------ public API for the menu / HUD
+
+    public String t(String vi, String en) { return vietnamese.get() ? vi : en; }
+
+    public void setVietnamese(boolean v) { vietnamese.set(v); }
+
+    public void openMenu() {
+        mc.execute(() -> mc.setScreen(new BuildMenuScreen(GuiThemes.get(), this)));
+    }
+
+    public boolean isRunning() { return running; }
+    public String loadedName() { return loadedName; }
+    public int unmatchedCount() { return unmatched.size(); }
+    public int scaffoldCount() { return scaffolds.size(); }
+    public boolean isLoaded() { return totalCount > 0; }
+
+    public String yMinText() { return yMin == null ? "" : String.valueOf(yMin); }
+    public String yMaxText() { return yMax == null ? "" : String.valueOf(yMax); }
+    public void setYMin(String s) { yMin = parseInt(s); }
+    public void setYMax(String s) { yMax = parseInt(s); }
+
+    private static Integer parseInt(String s) {
+        try { return s == null || s.isBlank() ? null : Integer.valueOf(s.trim()); } catch (NumberFormatException e) { return null; }
+    }
+
+    private boolean inYRange(int y) { return (yMin == null || y >= yMin) && (yMax == null || y <= yMax); }
+
+    public void toggleRun() {
+        if (running) pause(); else start();
+    }
+
+    public void start() {
+        if (mc.player == null) return;
+        if (pending.isEmpty() && !finished) {
+            if (file.get().isBlank()) { warning(t("Chưa chọn file schematic.", "No schematic selected.")); return; }
+            loadFile(true);
+            if (pending.isEmpty()) return;
+        }
+        if (pending.isEmpty() && finished) loadFile(false); // run again over the same spot
+        if (!isActive()) toggle();
+        running = true; finished = false; stall = 0;
+    }
+
+    public void pause() { running = false; }
+
+    /** Re-read the file and re-scan the world, keeping the same build position. */
+    public void restore() { if (!file.get().isBlank()) loadFile(false); }
+
+    public void retryUnmatched() { unmatched.clear(); stall = 0; if (finished && !pending.isEmpty()) finished = false; }
+
+    public void cleanScaffolds() { forceClean = true; }
+
+    public String statusText() {
+        if (totalCount == 0) return t("Chưa nạp schematic", "No schematic loaded");
+        if (finished) return t("Hoàn thành", "Finished");
+        if (running) return t("ĐANG XÂY", "BUILDING");
+        return statDoneAll() == 0 ? t("Sẵn sàng", "Ready") : t("Tạm dừng", "Paused");
+    }
+
+    private int statDoneAll() { return Math.max(0, totalCount - pending.size()); }
+    public int totalCount() { return totalCount; }
+    public int doneCount() { return statDoneAll(); }
+    public boolean hasLayer() { return statHasLayer; }
+    public int layerY() { return statLayerY; }
+    public int layerDone() { return statLayerDone; }
+    public int layerTotal() { return statLayerTotal; }
+    public int needSum() { return statNeed; }
+    public int haveSum() { return statHave; }
+    public List<Need> needs() { return statNeeds; }
+
+    public static double pct(int a, int b) { return b <= 0 ? 0 : a * 100.0 / b; }
+
+    // ------------------------------------------------------------------ file picking
+
+    /** Opens the native file dialog on its own thread (it blocks), then loads the chosen file on the game thread. */
+    public void pickFile() {
+        if (picking) return;
+        picking = true;
+        String startDir = new File(mc.runDirectory, "schematics").getAbsolutePath() + File.separator;
+        Thread th = new Thread(() -> {
+            String res = null;
+            Throwable err = null;
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                PointerBuffer filters = stack.mallocPointer(1);
+                filters.put(stack.UTF8("*.litematic")).flip();
+                res = TinyFileDialogs.tinyfd_openFileDialog("Chọn file .litematic / Select a .litematic file",
+                    startDir, filters, "Litematica schematic (*.litematic)", false);
+            } catch (Throwable e) {
+                err = e;
+            }
+            String picked = res;
+            Throwable failure = err;
+            mc.execute(() -> {
+                picking = false;
+                if (failure != null) {
+                    error(t("Không mở được hộp thoại chọn file (", "Could not open the file dialog (") + failure + t("). Hãy kéo-thả file vào menu.", "). Drag & drop the file onto the menu instead."));
+                } else if (picked != null && !picked.isBlank()) {
+                    selectFile(Paths.get(picked.split("\\|")[0]));
+                }
+            });
+        }, "schematic-file-picker");
+        th.setDaemon(true);
+        th.start();
+    }
+
+    /** Called by the file dialog and by drag & drop. */
+    public void selectFile(Path path) {
+        if (path == null || !path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".litematic")) {
+            error(t("Chỉ hỗ trợ file .litematic.", "Only .litematic files are supported."));
+            return;
+        }
+        file.set(path.toAbsolutePath().toString());
+        loadFile(true);
     }
 
     // ------------------------------------------------------------------ loading
 
     @Override
     public void onActivate() {
-        pending.clear(); targetSet.clear(); unmatched.clear(); scaffolds.clear(); fixes.clear();
-        timer = 0; warnCooldown = 0; stall = 0; skippedLoad = 0; abort = false;
-        if (mc.player == null) { abort = true; return; }
-
-        String raw = file.get().trim().replace("\"", "");
-        Path path = Paths.get(raw);
-        if (raw.isEmpty() || !Files.isRegularFile(path)) {
-            error("File not found: " + raw);
-            abort = true;
-            return;
+        if (mc.player == null) return;
+        warnCooldown = 0; stall = 0; timer = 0;
+        if (pending.isEmpty() && !file.get().isBlank()) {
+            loadFile(true);
+        } else if (pending.isEmpty()) {
+            info(t("Chưa chọn file - mở menu để nạp schematic.", "No file selected - open the menu to load a schematic."));
+            openMenu();
         }
-        try {
-            load(path);
-        } catch (Exception e) {
-            error("Could not read the schematic: " + e);
-            abort = true;
-            return;
-        }
-        if (notify.get()) info("Loaded %d blocks to place.", pending.size());
     }
 
     @Override
     public void onDeactivate() {
+        running = false;
         InvUtils.swapBack();
     }
 
+    public void loadFile(boolean newAnchor) {
+        if (mc.player == null) return;
+        pending.clear(); targetSet.clear(); unmatched.clear(); fixes.clear(); layerTotals.clear();
+        skippedLoad = 0; stall = 0; timer = 0; finished = false; running = false; totalCount = 0; loadedName = "";
+
+        String raw = file.get().trim().replace("\"", "");
+        Path path = raw.isEmpty() ? null : Paths.get(raw);
+        if (path == null || !Files.isRegularFile(path)) {
+            error(t("Không tìm thấy file: ", "File not found: ") + raw);
+            return;
+        }
+        try {
+            load(path, newAnchor);
+        } catch (Exception e) {
+            pending.clear(); targetSet.clear();
+            error(t("Không đọc được schematic: ", "Could not read the schematic: ") + e);
+            return;
+        }
+        totalCount = pending.size();
+        for (Target t : pending) layerTotals.merge(t.pos().getY(), 1, Integer::sum);
+        loadedName = path.getFileName().toString();
+        recomputeStats();
+        if (notify.get()) info(t("Đã nạp %d block cần đặt.", "Loaded %d blocks to place."), pending.size());
+        if (autoStart.get() && !pending.isEmpty()) running = true;
+    }
+
     @SuppressWarnings("unchecked")
-    private void load(Path path) throws IOException {
+    private void load(Path path, boolean newAnchor) throws IOException {
         Map<String, Object> root;
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(new GZIPInputStream(Files.newInputStream(path))))) {
             if (in.readUnsignedByte() != 10) throw new IOException("not an NBT file");
@@ -205,8 +399,14 @@ public class SchematicBuild extends Module {
             }
         }
 
-        Direction fwd = mc.player.getHorizontalFacing();
-        BlockPos origin = mc.player.getBlockPos().offset(fwd, forwardOffset.get());
+        BlockPos origin;
+        if (newAnchor || anchor == null) {
+            Direction fwd = mc.player.getHorizontalFacing();
+            origin = mc.player.getBlockPos().offset(fwd, forwardOffset.get());
+            anchor = origin;
+        } else {
+            origin = anchor;
+        }
         for (Target t : raw) {
             BlockPos p = origin.add(t.pos().getX() - minX, t.pos().getY() - minY, t.pos().getZ() - minZ);
             pending.add(new Target(p, t.state()));
@@ -351,6 +551,87 @@ public class SchematicBuild extends Module {
         return false;
     }
 
+    // ------------------------------------------------------------------ stats (menu + HUD)
+
+    private void recomputeStats() {
+        statHasLayer = false; statLayerDone = 0; statLayerTotal = 0; statNeed = 0; statHave = 0; statNeeds = List.of();
+        if (mc.world == null || mc.player == null || pending.isEmpty()) return;
+
+        int layer = 0;
+        for (Target t : pending) {
+            if (unmatched.contains(t.pos()) || !inYRange(t.pos().getY())) continue;
+            layer = t.pos().getY();
+            statHasLayer = true;
+            break;
+        }
+        if (!statHasLayer) return;
+
+        int left = 0;
+        Map<Item, Integer> needs = new LinkedHashMap<>();
+        for (Target t : pending) {
+            int y = t.pos().getY();
+            if (y < layer) continue;
+            if (y > layer) break;
+            left++;
+            Item it = itemFor(t.state());
+            if (it == null) continue;
+            int n = 1;
+            if (isDoubleSlab(t.state())) {
+                BlockState c = mc.world.getBlockState(t.pos());
+                n = c.getBlock() == t.state().getBlock() ? 1 : 2;
+            }
+            needs.merge(it, n, Integer::sum);
+        }
+        statLayerY = layer;
+        statLayerTotal = layerTotals.getOrDefault(layer, left);
+        statLayerDone = Math.max(0, statLayerTotal - left);
+
+        List<Need> list = new ArrayList<>();
+        for (Map.Entry<Item, Integer> e : needs.entrySet()) {
+            Item want = e.getKey();
+            int have = InvUtils.find(s -> s.getItem() == want, 0, 8).count(); // sum of all 9 hotbar slots
+            list.add(new Need(e.getKey().getName().getString(), e.getValue(), have));
+            statNeed += e.getValue();
+            statHave += Math.min(have, e.getValue());
+        }
+        statNeeds = list;
+    }
+
+    // ------------------------------------------------------------------ HUD
+
+    @EventHandler
+    private void onRender(Render2DEvent event) {
+        if (!hud.get() || mc.player == null || mc.currentScreen != null) return;
+
+        List<String> lines = new ArrayList<>();
+        if (statHasLayer) {
+            lines.add(String.format(Locale.ROOT, "Layer Y=%d: %d / %d · %.1f%%", statLayerY, statLayerDone, statLayerTotal, pct(statLayerDone, statLayerTotal)));
+        }
+        lines.add(String.format(Locale.ROOT, "%s: %d / %d · %.1f%%", t("Tổng", "Total"), statDoneAll(), totalCount, pct(statDoneAll(), totalCount)));
+        lines.add(t("Trạng thái: ", "Status: ") + statusText());
+        if (statHasLayer) {
+            lines.add(String.format(Locale.ROOT, "%s · %s %d · Hotbar %d · %s %d", t("Vật liệu tầng", "Layer items"),
+                t("Cần", "Required"), statNeed, statHave, t("Thiếu", "Missing"), statNeed - statHave));
+            int shown = 0;
+            for (Need n : statNeeds) {
+                if (shown++ >= 6) { lines.add("..."); break; }
+                lines.add(n.name() + ": " + n.have() + " / " + n.need() + (n.have() >= n.need() ? " ✓" : " ✗"));
+            }
+        }
+        if (!unmatched.isEmpty()) lines.add(t("Block lỗi: ", "Bad blocks: ") + unmatched.size());
+        if (!scaffolds.isEmpty()) lines.add(t("Support tạm: ", "Temp supports: ") + scaffolds.size());
+        lines.add("[" + menuKey.get() + "] " + t("Menu", "Menu") + "  [" + runKey.get() + "] " + t("Chạy/tạm dừng", "Run/pause"));
+
+        DrawContext ctx = event.drawContext;
+        int w = 0;
+        for (String s : lines) w = Math.max(w, mc.textRenderer.getWidth(s));
+        int x = 6, y = 6, lh = mc.textRenderer.fontHeight + 2;
+        ctx.fill(x - 4, y - 4, x + w + 4, y + lines.size() * lh + 2, 0xB0101820);
+        for (int i = 0; i < lines.size(); i++) {
+            ctx.drawTextWithShadow(mc.textRenderer, lines.get(i), x, y + i * lh, i == lines.size() - 1 ? 0xFF8FA3B8 : 0xFFFFFFFF);
+        }
+    }
+
     // ------------------------------------------------------------------ orientation search
 
     private Plan findPlan(BlockPos pos, BlockState want) {
@@ -428,7 +709,7 @@ public class SchematicBuild extends Module {
 
     /** Breaks one scaffold whose target is finished. Returns true if it used this tick. */
     private boolean breakScaffolds() {
-        if (scaffolds.isEmpty()) return false;
+        if (scaffolds.isEmpty()) { forceClean = false; return false; }
         Vec3d eye = mc.player.getEyePos();
         Iterator<Map.Entry<BlockPos, BlockPos>> it = scaffolds.entrySet().iterator();
         while (it.hasNext()) {
@@ -437,7 +718,7 @@ public class SchematicBuild extends Module {
             BlockState cur = mc.world.getBlockState(sp);
             if (cur.isReplaceable()) { it.remove(); continue; }          // already gone
             if (!cur.isOf(scaffoldBlock.get())) { it.remove(); continue; } // not ours any more - leave it alone
-            boolean servedDone = !mc.world.getBlockState(served).isReplaceable() || unmatched.contains(served);
+            boolean servedDone = forceClean || !mc.world.getBlockState(served).isReplaceable() || unmatched.contains(served);
             if (!servedDone) continue;
             if (eye.distanceTo(Vec3d.ofCenter(sp)) > range.get()) continue;
 
@@ -481,22 +762,25 @@ public class SchematicBuild extends Module {
     // ------------------------------------------------------------------ main loop
 
     private void finish(String extra) {
+        running = false;
+        finished = true;
+        recomputeStats();
         if (notify.get()) {
-            info("Schematic finished.");
+            info(t("Hoàn thành schematic.", "Schematic finished."));
             if (extra != null) warning(extra);
-            if (!unmatched.isEmpty()) warning("%d blocks were skipped (no way to place them with that orientation, or not placeable).", unmatched.size());
-            if (skippedLoad > 0) info("%d blocks need no action (upper door halves, beds' heads, fluids...).", skippedLoad);
+            if (!unmatched.isEmpty()) warning(t("%d block bị bỏ qua (không có cách đặt đúng hướng hoặc không đặt được).", "%d blocks were skipped (no way to place them with that orientation, or not placeable)."), unmatched.size());
+            if (skippedLoad > 0) info(t("%d block không cần thao tác (nửa trên cửa, đầu giường, chất lỏng...).", "%d blocks need no action (upper door halves, beds' heads, fluids...)."), skippedLoad);
         }
-        toggle();
     }
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (abort) { abort = false; toggle(); return; }
         if (mc.player == null || mc.world == null || mc.interactionManager == null) return;
         if (warnCooldown > 0) warnCooldown--;
+        if (--statTimer <= 0) { statTimer = 10; recomputeStats(); }
 
         if (breakScaffolds()) return;   // breaking needs a call every tick
+        if (!running) return;
         if (timer > 0) { timer--; return; }
 
         // ---- refresh the pending list
@@ -515,7 +799,16 @@ public class SchematicBuild extends Module {
         }
 
         boolean allSkipped = true;
-        for (Target t : pending) if (!unmatched.contains(t.pos())) { allSkipped = false; break; }
+        int layerY = 0;
+        boolean haveLayer = false;
+        for (Target t : pending) {
+            if (!unmatched.contains(t.pos()) && inYRange(t.pos().getY())) {
+                allSkipped = false;
+                layerY = t.pos().getY();
+                haveLayer = true;
+                break;
+            }
+        }
         if (allSkipped && scaffolds.isEmpty() && (fixes.isEmpty() || !fixStates.get())) { finish(null); return; }
 
         // ---- place
@@ -528,6 +821,11 @@ public class SchematicBuild extends Module {
             if (placed >= blocksPerTick.get()) break;
             BlockPos pos = t.pos();
             if (unmatched.contains(pos)) continue;
+            if (!inYRange(pos.getY())) continue;
+            if (strictLayers.get() && haveLayer && pos.getY() != layerY) {
+                if (pos.getY() > layerY) break;   // pending is sorted by Y
+                continue;
+            }
             if (eye.distanceTo(Vec3d.ofCenter(pos)) > range.get()) continue;
 
             BlockState want = t.state();
@@ -591,17 +889,17 @@ public class SchematicBuild extends Module {
             stall++;
             if (stall > 150) {
                 int left = 0;
-                for (Target t : pending) if (!unmatched.contains(t.pos())) left++;
-                finish(left + " blocks could not be placed (out of reach, missing items, or nothing to attach to).");
+                for (Target t : pending) if (!unmatched.contains(t.pos()) && inYRange(t.pos().getY())) left++;
+                finish(left + t(" block chưa đặt được (ngoài tầm với, thiếu vật phẩm, hoặc không có chỗ bám).", " blocks could not be placed (out of reach, missing items, or nothing to attach to)."));
                 return;
             }
             if (notify.get() && warnCooldown == 0) {
                 if (!missing.isEmpty()) {
                     StringBuilder sb = new StringBuilder();
                     for (Block b : missing) { if (sb.length() > 0) sb.append(", "); sb.append(b.getName().getString()); }
-                    warning("Missing in hotbar: " + sb);
+                    warning(t("Thiếu trong hotbar: ", "Missing in hotbar: ") + sb);
                 } else {
-                    warning("Nothing in range to place - move closer to the unfinished part.");
+                    warning(t("Không có gì trong tầm với - hãy lại gần phần chưa xây.", "Nothing in range to place - move closer to the unfinished part."));
                 }
                 warnCooldown = 200;
             }
