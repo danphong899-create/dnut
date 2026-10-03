@@ -14,8 +14,9 @@
   "environment": "client",
   "entrypoints": {
     "meteor": [
-      "com.example.addon.AddonTemplate"
-    ]
+  "com.example.addon.AddonTemplate",
+  "com.example.addon.DonutAddon"
+]
   },
   "mixins": [
     "addon-template.mixins.json"
