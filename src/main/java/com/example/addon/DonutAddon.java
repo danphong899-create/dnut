@@ -1,8 +1,10 @@
 package com.example.addon;
 
+import com.example.addon.modules.AutoAttackMob;
 import com.example.addon.modules.AutoLogoutOnPlayer;
 import com.example.addon.modules.AutoOminousBottle;
 import com.example.addon.modules.AutoOrder;
+import com.example.addon.modules.AutoRepair;
 import com.example.addon.modules.AutoSellDonut;
 import com.mojang.logging.LogUtils;
 import meteordevelopment.meteorclient.addons.GithubRepo;
@@ -22,6 +24,8 @@ public class DonutAddon extends MeteorAddon {
         Modules.get().add(new AutoSellDonut());
         Modules.get().add(new AutoLogoutOnPlayer());
         Modules.get().add(new AutoOrder());
+        Modules.get().add(new AutoAttackMob());
+        Modules.get().add(new AutoRepair());
     }
 
     @Override
