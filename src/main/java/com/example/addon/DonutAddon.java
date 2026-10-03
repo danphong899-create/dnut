@@ -2,6 +2,7 @@ package com.example.addon;
 
 import com.example.addon.modules.AutoLogoutOnPlayer;
 import com.example.addon.modules.AutoOminousBottle;
+import com.example.addon.modules.AutoOrder;
 import com.example.addon.modules.AutoSellDonut;
 import com.mojang.logging.LogUtils;
 import meteordevelopment.meteorclient.addons.GithubRepo;
@@ -20,6 +21,7 @@ public class DonutAddon extends MeteorAddon {
         Modules.get().add(new AutoOminousBottle());
         Modules.get().add(new AutoSellDonut());
         Modules.get().add(new AutoLogoutOnPlayer());
+        Modules.get().add(new AutoOrder());
     }
 
     @Override
