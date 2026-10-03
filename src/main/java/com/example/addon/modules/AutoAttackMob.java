@@ -39,6 +39,10 @@ public class AutoAttackMob extends Module {
         .name("wait-cooldown").description("Only swing when the weapon is fully charged.")
         .defaultValue(true).build());
 
+    public AutoAttackMob() {
+        super(DonutAddon.CATEGORY, "auto-attack-mob", "Automatically attacks selected mobs in range (never players).");
+    }
+
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.world == null || mc.interactionManager == null) return;
