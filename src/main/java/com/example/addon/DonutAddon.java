@@ -6,6 +6,7 @@ import com.example.addon.modules.AutoOminousBottle;
 import com.example.addon.modules.AutoOrder;
 import com.example.addon.modules.AutoRepair;
 import com.example.addon.modules.AutoSellDonut;
+import com.example.addon.modules.SchematicBuild;
 import com.mojang.logging.LogUtils;
 import meteordevelopment.meteorclient.addons.GithubRepo;
 import meteordevelopment.meteorclient.addons.MeteorAddon;
@@ -26,6 +27,7 @@ public class DonutAddon extends MeteorAddon {
         Modules.get().add(new AutoOrder());
         Modules.get().add(new AutoAttackMob());
         Modules.get().add(new AutoRepair());
+        Modules.get().add(new SchematicBuild());
     }
 
     @Override
